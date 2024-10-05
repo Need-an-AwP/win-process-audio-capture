@@ -1,0 +1,21 @@
+{
+  "name": "win-process-audio-capture",
+  "version": "0.0.1",
+  "description": "package nodegyp addon",
+  "main": "index.js",
+  "gypfile": false,
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "klz",
+  "license": "ISC",
+  "files": [
+    "index.js",
+    "build/Release/test_addon.node"
+  ],
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "engines": {
+    "node": ">= 12.0.0"
+  }
+}
