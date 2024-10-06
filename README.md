@@ -1,6 +1,7 @@
 # win-process-audio-capture
 
 Windows 进程音频捕获的 Node.js 原生插件。
+这个仓库仅用于打包模块
 
 ## 描述
 
@@ -14,7 +15,8 @@ npm install win-process-audio-capture
 
 ## 使用方法
 
-参考https://github.com/Need-an-AwP/Capture-Audio-from-Process---javascript-addon
+用例参考
+https://github.com/Need-an-AwP/Capture-Audio-from-Process---javascript-addon
 
 ## 重要说明
 
