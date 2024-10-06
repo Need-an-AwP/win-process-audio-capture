@@ -20,7 +20,9 @@ npm install win-process-audio-capture
 
 只考虑提供预编译版本
 
-仅支持windows
+**仅支持windows**
+
+**index.d.ts由claude根据源代码生成**
 
 ## 对于开发者
 
@@ -42,10 +44,9 @@ npm run build
 
 ## 故障排除
 
-运行 `npm install` 可能会出错，这是因为 `npm install` 会自动运行 `node-gyp rebuild`，而 `node-gyp rebuild` 可能会导致未知的编译错误。本模块设计为无需重新构建即可工作，所以如
+运行 `npm install` 可能会出错，这是因为 `npm install` 会自动运行 `node-gyp rebuild`，而 `node-gyp rebuild` 可能会导致未知的编译错误
 
-
-```
-"build": "node-gyp configure && node-gyp build",
+```bash
+node-gyp configure && node-gyp build
 ```
 
