@@ -42,7 +42,7 @@ https://github.com/Need-an-AwP/Capture-Audio-from-Process---javascript-addon
 npm run build
 ```
 
-然而，除非你在为模块的开发做贡献，否则不建议重新构建。
+不建议重新构建。
 
 ## 故障排除
 

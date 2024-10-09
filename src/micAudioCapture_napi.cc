@@ -33,6 +33,7 @@
 #include <iomanip>
 #include <cstring>
 #include <cstdint>
+#include <memory>
 
 using namespace Microsoft::WRL;
 
@@ -985,10 +986,297 @@ Napi::Value capture_500_async(const Napi::CallbackInfo &info)
     return env.Undefined();
 }
 
-HRESULT eventCallBack_SampleReady()
+class ContinuousCaptureWorker : public Napi::AsyncWorker
 {
+public:
+    ContinuousCaptureWorker(Napi::Function callback, int intervalMs)
+        : Napi::AsyncWorker(callback), intervalMs(intervalMs),
+          tsfn(Napi::ThreadSafeFunction::New(
+              callback.Env(),
+              callback,
+              "Simple Worker Callback",
+              0,
+              1))
+    {
+    }
 
-    return S_OK;
+    void Execute() override
+    {
+        UINT32 packetLength = 0;
+        BYTE *Data = nullptr;
+        HRESULT hr;
+        DWORD dwCaptureFlags;
+        UINT32 nNumFramesCaptured = 0;
+        while (!shouldStop)
+        {
+            UINT32 desiredFrameCount = static_cast<UINT32>((intervalMs / 1000.0) * mCaptureFormat->nSamplesPerSec);
+            result.totalFramesCaptured = 0;
+            result.n = 0;
+
+            while (result.totalFramesCaptured < desiredFrameCount)
+            {
+                mAudioCaptureClient->GetNextPacketSize(&packetLength);
+
+                if (packetLength == 0)
+                {
+                    continue;
+                }
+
+                hr = mAudioCaptureClient->GetBuffer(&Data,
+                                                    &nNumFramesCaptured,
+                                                    &dwCaptureFlags,
+                                                    NULL,
+                                                    NULL);
+                result.capturedFramesList.push_back(nNumFramesCaptured);
+                result.totalFramesCaptured += nNumFramesCaptured;
+                result.pcmData.insert(result.pcmData.end(), Data, Data + nNumFramesCaptured * mCaptureFormat->nBlockAlign);
+                mAudioCaptureClient->ReleaseBuffer(nNumFramesCaptured);
+                result.n++;
+                result.packetSizeList.push_back(packetLength);
+
+                if (result.totalFramesCaptured >= desiredFrameCount)
+                {
+                    break;
+                }
+            }
+            if (shouldStop)
+                break;
+
+            if (g_AudioClient)
+            {
+                hr = g_AudioClient->GetCurrentPadding(&result.numPaddingFrames);
+                result.currentPaddingFramesSuccess = SUCCEEDED(hr);
+            }
+
+            // 设置 WAV 头
+            result.wavHeader.numChannels = mCaptureFormat->nChannels;
+            result.wavHeader.sampleRate = mCaptureFormat->nSamplesPerSec;
+            result.wavHeader.bitsPerSample = mCaptureFormat->wBitsPerSample;
+            result.wavHeader.blockAlign = mCaptureFormat->nBlockAlign;
+            result.wavHeader.byteRate = mCaptureFormat->nAvgBytesPerSec;
+            result.wavHeader.dataChunkSize = static_cast<uint32_t>(result.pcmData.size());
+            result.wavHeader.chunkSize = result.wavHeader.dataChunkSize + sizeof(WAVHeader) - 8;
+
+            auto resultCopy = std::make_shared<CaptureResult>(result);
+            auto status = tsfn.NonBlockingCall([resultCopy](Napi::Env env, Napi::Function jsCallback)
+            {
+                Napi::Object res = Napi::Object::New(env);
+                res.Set("totalFramesCaptured", Napi::Number::From(env, resultCopy->totalFramesCaptured));
+                res.Set("n", Napi::Number::From(env, resultCopy->n));
+
+                Napi::Uint8Array pcmArray = Napi::Uint8Array::New(env, resultCopy->pcmData.size());
+                std::copy(resultCopy->pcmData.begin(), resultCopy->pcmData.end(), pcmArray.Data());
+                res.Set("pcmData", pcmArray);
+
+                Napi::Uint32Array capturedFramesArray = Napi::Uint32Array::New(env, resultCopy->capturedFramesList.size());
+                std::copy(resultCopy->capturedFramesList.begin(), resultCopy->capturedFramesList.end(), capturedFramesArray.Data());
+                res.Set("numberOfcapturedFramesArray", capturedFramesArray);
+
+                Napi::Uint32Array packetSizeArray = Napi::Uint32Array::New(env, resultCopy->packetSizeList.size());
+                std::copy(resultCopy->packetSizeList.begin(), resultCopy->packetSizeList.end(), packetSizeArray.Data());
+                res.Set("packetSizeArray", packetSizeArray);
+
+                std::vector<uint8_t> wavData(sizeof(WAVHeader) + resultCopy->pcmData.size());
+                std::memcpy(wavData.data(), &resultCopy->wavHeader, sizeof(WAVHeader));
+                std::memcpy(wavData.data() + sizeof(WAVHeader), resultCopy->pcmData.data(), resultCopy->pcmData.size());
+                Napi::Uint8Array wavArray = Napi::Uint8Array::New(env, wavData.size());
+                std::copy(wavData.begin(), wavData.end(), wavArray.Data());
+                res.Set("wavData", wavArray);
+
+                jsCallback.Call({env.Null(), res});
+            });
+
+            if (status != napi_ok)
+            {
+                break;
+            }
+
+            result = CaptureResult(); // 重置 result
+        }
+    }
+
+    void OnOK() override
+    {
+    }
+
+    void Stop()
+    {
+        shouldStop = true;
+    }
+
+    ~ContinuousCaptureWorker()
+    {
+        Stop();
+        if (tsfn)
+        {
+            tsfn.Release();
+        }
+    }
+
+private:
+    struct CaptureResult
+    {
+        std::vector<uint8_t> pcmData;
+        std::vector<UINT32> capturedFramesList;
+        std::vector<UINT32> packetSizeList;
+        UINT32 totalFramesCaptured = 0;
+        UINT8 n = 0;
+        UINT32 numPaddingFrames = 0;
+        bool currentPaddingFramesSuccess = false;
+        WAVHeader wavHeader{};
+    };
+
+    CaptureResult result;
+    bool hasData;
+    int intervalMs;
+    Napi::ThreadSafeFunction tsfn;
+    std::atomic<bool> shouldStop{false};
+};
+
+Napi::Value capture_async(const Napi::CallbackInfo &info)
+{
+    Napi::Env env = info.Env();
+
+    // default interval is 500ms
+    int intervalMs = 500;
+
+    if (info.Length() < 1 || info.Length() > 2)
+    {
+        Napi::TypeError::New(env, "Wrong number of arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (info.Length() == 2)
+    {
+        if (!info[0].IsNumber() || !info[1].IsFunction())
+        {
+            Napi::TypeError::New(env, "Wrong arguments").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        intervalMs = info[0].As<Napi::Number>().Int32Value();
+        if (intervalMs <= 0)
+        {
+            Napi::RangeError::New(env, "Interval must be positive").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+    }
+    else if (!info[0].IsFunction())
+    {
+        Napi::TypeError::New(env, "Function expected").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Function callback = info[1].As<Napi::Function>();
+
+    // auto worker = std::make_shared<ContinuousCaptureWorker>(callback, intervalMs);// cause js crush, have no reason
+    auto worker = new ContinuousCaptureWorker(callback, intervalMs);
+    worker->Queue();
+
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("stop", Napi::Function::New(env, [worker](const Napi::CallbackInfo &info)
+                                           { worker->Stop(); }));
+
+    return result;
+}
+
+class SimpleWorker : public Napi::AsyncWorker
+{
+public:
+    SimpleWorker(Napi::Function callback, int intervalMs)
+        : Napi::AsyncWorker(callback), intervalMs(intervalMs),
+          tsfn(Napi::ThreadSafeFunction::New(
+              callback.Env(),
+              callback,
+              "Simple Worker Callback",
+              0,
+              1))
+    {
+    }
+
+    void Execute() override
+    {
+        int count = 0;
+        while (!shouldStop)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+            if (shouldStop)
+                break;
+
+            std::string message = "Message " + std::to_string(++count);
+            auto status = tsfn.NonBlockingCall([message](Napi::Env env, Napi::Function jsCallback)
+                                               { jsCallback.Call({env.Null(), Napi::String::New(env, message)}); });
+
+            if (status != napi_ok)
+            {
+                break;
+            }
+        }
+    }
+
+    void OnOK() override
+    {
+    }
+
+    void Stop()
+    {
+        shouldStop = true;
+    }
+
+    ~SimpleWorker()
+    {
+        Stop();
+        if (tsfn)
+        {
+            tsfn.Release();
+        }
+    }
+
+private:
+    int intervalMs;
+    Napi::ThreadSafeFunction tsfn;
+    std::atomic<bool> shouldStop{false};
+};
+
+Napi::Value StartSimpleWorker(const Napi::CallbackInfo &info)
+{
+    Napi::Env env = info.Env();
+
+    // default interval is 500ms
+    int intervalMs = 500;
+
+    if (info.Length() < 1 || info.Length() > 2)
+    {
+        Napi::TypeError::New(env, "Wrong number of arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (info.Length() == 2)
+    {
+        if (!info[0].IsNumber() || !info[1].IsFunction())
+        {
+            Napi::TypeError::New(env, "Wrong arguments").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        intervalMs = info[0].As<Napi::Number>().Int32Value();
+        if (intervalMs <= 0)
+        {
+            Napi::RangeError::New(env, "Interval must be positive").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+    }
+    else if (!info[0].IsFunction())
+    {
+        Napi::TypeError::New(env, "Function expected").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Function callback = info[1].As<Napi::Function>();
+
+    // auto worker = std::make_shared<SimpleWorker>(callback, intervalMs);// cause js crush, have no reason
+    auto worker = new SimpleWorker(callback, intervalMs);
+    worker->Queue();
+
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("stop", Napi::Function::New(env, [worker](const Napi::CallbackInfo &info)
+                                           { worker->Stop(); }));
+
+    return result;
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports)
@@ -1005,6 +1293,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports)
     exports.Set(Napi::String::New(env, "captureProcessAudio"), Napi::Function::New(env, captureProcessAudio));
     exports.Set(Napi::String::New(env, "whileCaptureProcessAudio"), Napi::Function::New(env, whileCaptureProcessAudio));
     exports.Set(Napi::String::New(env, "capture_500_async"), Napi::Function::New(env, capture_500_async));
+    exports.Set(Napi::String::New(env, "capture_async"), Napi::Function::New(env, capture_async));
 
     return exports;
 }
